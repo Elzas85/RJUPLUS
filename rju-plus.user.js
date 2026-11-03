@@ -1,473 +1,891 @@
 // ==UserScript==
 // @name         RJU+ - Bajar ficha del Registro de Juicios Universales
 // @namespace    ignacio.kinbaum
-// @version      0.2.0
-// @description  Baja la ficha del RJU de la SCBA en PDF, armada con las mismas imagenes que estas viendo en pantalla. No usa el boton "Descargar" del sitio, que falla con error de servidor y a veces entrega la ficha de otro registro. Opcion de bajar sola apenas se abre la ficha. Panel movible por la pantalla, con minimizar y cerrar. Pestaña About con version, autoria y link al repositorio.
+// @version      0.3.0
+// @description  Baja en PDF la ficha del Registro de Juicios Universales de la SCBA, armada con las mismas imágenes que se ven en pantalla. No usa la descarga del sitio, que falla con error de servidor y a veces entrega la ficha de otro registro. Puede bajar la ficha sola apenas se abre; cada descarga pregunta dónde guardarse. Panel movible, con minimizar, maximizar y cerrar.
 // @author       Ignacio Kinbaum
-// @license      GPL-3.0-or-later
+// @license      Todos los derechos reservados
 // @copyright    2026, Ignacio Kinbaum (estudiojuridicokinbaum@gmail.com)
-// @homepageURL  https://github.com/Elzas85/RJUPLUS
-// @supportURL   https://github.com/Elzas85/RJUPLUS/issues
-// @updateURL    https://raw.githubusercontent.com/Elzas85/RJUPLUS/main/rju-plus.user.js
-// @downloadURL  https://raw.githubusercontent.com/Elzas85/RJUPLUS/main/rju-plus.user.js
+// @supportURL   mailto:estudiojuridicokinbaum@gmail.com
 // @match        https://rju.scba.gov.ar/*
 // @run-at       document-idle
-// @require      https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js
-// @grant        none
+// @grant        GM_download
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        unsafeWindow
+// @require      https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js#sha384=weMABwrltA6jWR8DDe9Jp5blk+tZQh7ugpCsF3JwSA53WZM9/14PjS5LAJNHNjAI
 // ==/UserScript==
 /*
  * RJU+ - Bajar ficha del Registro de Juicios Universales
  * Copyright (C) 2026  Ignacio Kinbaum  <estudiojuridicokinbaum@gmail.com>
+ * Todos los derechos reservados. Queda prohibida su copia, modificación o
+ * distribución sin autorización escrita del autor. Se entrega sin garantía.
+ * Desde la 0.3.0 (decisión del autor del 16/10/2026 para las aplicaciones de
+ * Lex+) las actualizaciones no se distribuyen por GitHub.
  *
- * Este programa es software libre: usted puede redistribuirlo y/o modificarlo
- * bajo los terminos de la Licencia Publica General GNU (GPL) publicada por la
- * Free Software Foundation, en su version 3 o, a su eleccion, cualquier
- * version posterior.
+ * Funcionamiento
  *
- * Este programa se distribuye con la esperanza de que sea util, pero SIN
- * NINGUNA GARANTIA. Vea la Licencia Publica General GNU para mas detalles.
- * https://www.gnu.org/licenses/gpl-3.0.html
+ *   1. La ficha que el RJU muestra en pantalla son imágenes /imagegen.aspx
+ *      (una por página). Las de /imagenpaginagen.aspx son las bandas con el
+ *      número de página y no forman parte de la ficha.
+ *   2. El PDF se arma copiando esas imágenes tal como están en pantalla
+ *      (lienzo). No se vuelven a pedir al servidor: el servidor es el que, a
+ *      veces, entrega la ficha de otro registro.
+ *   3. Los datos del nombre del archivo se toman de la fila que el propio RJU
+ *      marca como elegida en la grilla después del postback (fondo celeste).
+ *      Si no hay fila marcada, se usan los datos de la fila en la que se hizo
+ *      clic; si tampoco los hay, el archivo se nombra en forma genérica.
+ *   4. Cada descarga abre el cuadro "Guardar como" (GM_download con saveAs).
+ *      Si Tampermonkey no puede abrirlo, el panel ofrece "Guardar el PDF",
+ *      que abre el selector de archivos de Chrome. Nunca hay carpeta fija.
+ *   5. Una ficha se da por guardada solo después de una descarga exitosa.
+ *      Las bajadas automáticas que fallan se reintentan hasta tres veces.
+ *   6. El observador de la página ignora los cambios del propio panel.
+ *
+ * Origen de las correcciones de la 0.3.0: reporte de revisión de código del
+ * 28/10/2026 (hallazgos R1 a R14) y criterios comunes de Lex+.
  */
 /* global PDFLib */
 (function () {
   'use strict';
 
+  // ------------------------------------------------------------ configuración
+
+  const W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
   const APP = {
     nombre: 'RJU+ - Bajar ficha del Registro de Juicios Universales',
-    version: 'beta 0.2.0',
+    version: 'beta 0.3.0',
     autor: 'Ignacio Kinbaum',
-    anio: '2026',
-    mail: 'estudiojuridicokinbaum@gmail.com',
-    licencia: 'GPL-3.0-or-later',
-    licenciaUrl: 'https://www.gnu.org/licenses/gpl-3.0.html',
-    github: 'https://github.com/Elzas85/RJUPLUS'
+    licencia: 'Todos los derechos reservados'
   };
 
-  const VERDE = '#1a7f37';
-  const CLAVE_AUTO = 'rjuplus_auto';
-  const CLAVE_MIN = 'rjuplus_min';
-  const CLAVE_POS = 'rjuplus_pos';
+  const COLOR = {
+    verde: '#1a7f37',
+    ambar: '#b7791f',
+    rojo: '#b3261e',
+    texto: '#333'
+  };
 
-  // Estado
-  let filaSel = null; // indice de la fila de la grilla que se clickeo
-  let datosFila = null; // datos de esa fila, capturados ANTES del postback
-  let claveFicha = null; // huella de la ficha ya procesada, para no repetir
-  let trabajando = false;
+  const CLAVE_AUTO = 'rjuplus_auto';
+  const ID_PANEL = 'rjuplus';
+
+  // Colores con que el RJU pinta las filas de la grilla (relevados en vivo el
+  // 03/11/2026): blanco y gris alternados; celeste la fila elegida.
+  const COLOR_FILA_ELEGIDA = 'rgb(161, 220, 242)';
+  const COLORES_ALTERNADOS = ['rgb(255, 255, 255)', 'rgb(217, 218, 219)'];
+
+  const ESPERA_IMAGENES_MS = 20000;
+  const PAUSA_REINTENTO_MS = 3000;
+  const MAX_INTENTOS_AUTO = 3;
+  const A4 = { ancho: 595.28, alto: 841.89, margen: 14 };
+
+  // Columnas de la grilla, reconocidas por el encabezado (con la posición
+  // relevada como respaldo).
+  const REGLAS_COLUMNAS = [
+    ['anio', /^ano$/, 1],
+    ['oficio', /oficio/, 2],
+    ['apellido', /apellido/, 3],
+    ['nombre', /^nombre/, 4],
+    ['documento', /documento/, 5],
+    ['fallecimiento', /fallec/, 6]
+  ];
+
+  // ------------------------------------------------------------------- estado
+
+  const S = {
+    clicFila: null,          // { datos, firma }: fila tomada en el momento del clic
+    fichaActual: null,       // { clave, imgs, datos }
+    guardadas: new Set(),    // claves de fichas ya guardadas
+    resueltas: new Set(),    // claves cuya descarga se canceló a pedido
+    intentos: new Map(),     // clave -> intentos automáticos fallidos
+    trabajando: false,
+    apagada: false,
+    pendiente: null,         // { blob, nombre } a la espera de "Guardar el PDF"
+    historial: [],           // fichas procesadas en esta sesión
+    observador: null,
+    temporizador: null,
+    modo: 'min',             // 'min' | 'normal' | 'max'
+    modoAnterior: 'normal'
+  };
+
+  const UI = {};
 
   const dormir = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  function pref(k, def) {
-    try { const v = localStorage.getItem(k); return v === null ? def : v === '1'; }
-    catch (e) { return def; }
-  }
-  function guardarPref(k, v) {
-    try { localStorage.setItem(k, v ? '1' : '0'); } catch (e) { /* sin persistencia */ }
-  }
+  // -------------------------------------------------------------- preferencias
 
-  // ---------------------------------------------------------------- utilidades
-
-  function esImagenFicha(img) {
+  function leerGM(clave) {
     try {
-      const u = new URL(img.src, location.href);
-      return u.pathname.toLowerCase().endsWith('/imagegen.aspx');
-    } catch (e) { return false; }
+      if (typeof GM_getValue === 'function') return GM_getValue(clave, undefined);
+    } catch (e) { /* sin Tampermonkey */ }
+    return undefined;
   }
 
-  function nroPagina(img) {
+  // Valor guardado por la 0.2.0 en el almacenamiento del sitio.
+  function leerAnterior(clave) {
     try {
-      const u = new URL(img.src, location.href);
-      return parseInt(u.searchParams.get('pagina') || '0', 10);
-    } catch (e) { return 0; }
+      const v = localStorage.getItem(clave);
+      return v === null ? undefined : v === '1';
+    } catch (e) { return undefined; }
   }
 
-  // Solo /imagegen.aspx: las de /imagenpaginagen.aspx son las bandas con el
-  // numero de pagina, no forman parte de la ficha.
-  function imagenesDeLaFicha() {
-    return Array.from(document.querySelectorAll('img'))
-      .filter(esImagenFicha)
-      .sort((a, b) => nroPagina(a) - nroPagina(b));
+  function leerPref(clave, porDefecto) {
+    const gm = leerGM(clave);
+    if (gm !== undefined) return gm;
+    const anterior = leerAnterior(clave);
+    return anterior === undefined ? porDefecto : anterior;
   }
 
-  async function esperarCarga(imgs, msMax) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < (msMax || 20000)) {
-      if (imgs.length && imgs.every((i) => i.complete && i.naturalWidth > 0)) return true;
-      await dormir(250);
-    }
-    return false;
+  function guardarPref(clave, valor) {
+    try {
+      if (typeof GM_setValue === 'function') { GM_setValue(clave, valor); return; }
+    } catch (e) { /* se intenta en el sitio */ }
+    try { localStorage.setItem(clave, valor ? '1' : '0'); } catch (e) { /* sin persistencia */ }
+  }
+
+  function autoActiva() {
+    return UI.chkAuto ? UI.chkAuto.checked : leerPref(CLAVE_AUTO, true);
+  }
+
+  // ------------------------------------------------------------------ textos
+
+  function textoCelda(td) {
+    return (td.innerText || td.textContent || '').trim();
+  }
+
+  function normalizar(s) {
+    return String(s || '').normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().trim();
   }
 
   function limpiarNombre(s) {
     return String(s || '')
-      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .normalize('NFD').replace(/\p{M}/gu, '')
       .replace(/[^A-Za-z0-9_]+/g, '-')
       .replace(/-+/g, '-')
       .replace(/^[-_]+|[-_]+$/g, '');
   }
 
-  function nombreArchivo() {
-    const d = datosFila || {};
+  function dosCifras(n) {
+    return String(n).padStart(2, '0');
+  }
+
+  function sello(d) {
+    return d.getFullYear() + dosCifras(d.getMonth() + 1) + dosCifras(d.getDate()) + '-' +
+      dosCifras(d.getHours()) + dosCifras(d.getMinutes()) + dosCifras(d.getSeconds());
+  }
+
+  function horaCorta(d) {
+    return dosCifras(d.getHours()) + ':' + dosCifras(d.getMinutes());
+  }
+
+  function mensajeDeError(e) {
+    return e && e.message ? e.message : String(e);
+  }
+
+  function nombreArchivo(datos) {
+    const d = datos || {};
     const partes = ['RJU', d.anio, d.apellido, d.nombre, d.documento]
-      .map((x) => limpiarNombre(x))
+      .map(limpiarNombre)
       .filter((x) => x && x !== '0');
-    const base = partes.length > 1 ? partes.join('_') : 'RJU_ficha';
-    return base + '.pdf';
+    if (partes.length > 1) return partes.join('_') + '.pdf';
+    return 'RJU_ficha_' + sello(new Date()) + '.pdf';
   }
 
-  // ------------------------------------------------- lectura de la fila elegida
-
-  function capturarFila(idx) {
-    const g = document.getElementById('GridConsulta');
-    if (!g || !g.rows[idx + 1]) return null;
-    const c = Array.from(g.rows[idx + 1].cells).map((td) => (td.innerText || '').trim());
-    // Columnas: Ver | año | num_oficio | apellido | nombre | num_documento | fallecimiento
-    return {
-      anio: c[1] || '',
-      oficio: c[2] || '',
-      apellido: c[3] || '',
-      nombre: c[4] || '',
-      documento: c[5] || '',
-      fallecimiento: c[6] || ''
-    };
+  function descripcionDatos(datos) {
+    if (!datos || !datos.apellido) return '';
+    return datos.apellido + ' ' + (datos.nombre || '') +
+      (datos.documento ? ', doc. ' + datos.documento : '');
   }
 
-  // El dato se toma en el momento del clic, no despues del postback. Asi el
-  // archivo queda nombrado segun la fila que se eligio en pantalla.
-  function engancharPostBack() {
-    if (typeof window.__doPostBack !== 'function' || window.__doPostBack.__rjuplus) return;
-    const original = window.__doPostBack;
-    const envoltorio = function (target, arg) {
-      try {
-        const m = /^Select\$(\d+)$/.exec(String(arg || ''));
-        if (String(target) === 'GridConsulta' && m) {
-          filaSel = parseInt(m[1], 10);
-          datosFila = capturarFila(filaSel);
-          claveFicha = null; // se abre otra ficha, se habilita una nueva bajada
-        }
-      } catch (e) { /* no interrumpir el postback del sitio */ }
-      return original.apply(this, arguments);
-    };
-    envoltorio.__rjuplus = true;
-    window.__doPostBack = envoltorio;
+  // ------------------------------------------------------- lectura de la grilla
+
+  function grilla() {
+    return document.getElementById('GridConsulta');
+  }
+
+  function enlaceSelect(tr) {
+    return Array.from(tr.querySelectorAll('[onclick],[href]')).find((el) =>
+      /Select\$\d+/.test((el.getAttribute('onclick') || '') + (el.getAttribute('href') || '')));
+  }
+
+  function filasDeDatos(g) {
+    return Array.from(g.rows).filter((tr) => enlaceSelect(tr));
+  }
+
+  function columnasDeLaGrilla(g) {
+    const enc = g.rows[0] ? Array.from(g.rows[0].cells).map((td) => normalizar(textoCelda(td))) : [];
+    const col = {};
+    REGLAS_COLUMNAS.forEach(([campo, re, respaldo]) => {
+      const i = enc.findIndex((t) => re.test(t));
+      col[campo] = i >= 0 ? i : respaldo;
+    });
+    return col;
+  }
+
+  function datosDeFila(tr, col) {
+    const celdas = Array.from(tr.cells).map(textoCelda);
+    const datos = {};
+    Object.keys(col).forEach((campo) => { datos[campo] = celdas[col[campo]] || ''; });
+    return datos;
+  }
+
+  // Busca la fila por su enlace Select$N y no por la posición: con un
+  // paginador arriba, la posición no coincide con el índice (R13).
+  function filaPorIndice(g, idx) {
+    const re = new RegExp('Select\\$' + idx + '(?!\\d)');
+    const porEnlace = Array.from(g.rows).find((tr) => {
+      const el = enlaceSelect(tr);
+      return el && re.test((el.getAttribute('onclick') || '') + (el.getAttribute('href') || ''));
+    });
+    return porEnlace || null;
+  }
+
+  // Fila que el RJU marca como elegida después del postback.
+  function filaMarcada(g) {
+    const filas = filasDeDatos(g);
+    const celeste = filas.find((tr) => tr.style.backgroundColor === COLOR_FILA_ELEGIDA);
+    if (celeste) return celeste;
+    const distintas = filas.filter((tr) =>
+      tr.style.backgroundColor && !COLORES_ALTERNADOS.includes(tr.style.backgroundColor));
+    return distintas.length === 1 ? distintas[0] : null;
+  }
+
+  // El clic sirve solo para la ficha que llega después de él: queda atado a
+  // esas imágenes y una ficha distinta nunca hereda sus datos (R3).
+  function clicVigente(firma) {
+    return !!S.clicFila && (!S.clicFila.firma || S.clicFila.firma === firma);
+  }
+
+  function datosDeLaFichaAbierta(firma) {
+    const g = grilla();
+    const tr = g ? filaMarcada(g) : null;
+    if (tr) return { datos: datosDeFila(tr, columnasDeLaGrilla(g)), origen: 'grilla' };
+    if (clicVigente(firma)) return { datos: S.clicFila.datos, origen: 'clic' };
+    return { datos: null, origen: 'ninguno' };
+  }
+
+  // ------------------------------------------------------- ficha en pantalla
+
+  function urlDeImagen(img) {
+    try { return new URL(img.src, location.href); } catch (e) { return null; }
+  }
+
+  function esImagenFicha(img) {
+    const u = urlDeImagen(img);
+    return !!u && u.pathname.toLowerCase().endsWith('/imagegen.aspx');
+  }
+
+  function nroPagina(img) {
+    const u = urlDeImagen(img);
+    return u ? parseInt(u.searchParams.get('pagina') || '0', 10) : 0;
+  }
+
+  function imagenesDeLaFicha() {
+    return Array.from(document.querySelectorAll('img'))
+      .filter((img) => !img.closest('#' + ID_PANEL))
+      .filter(esImagenFicha)
+      .sort((a, b) => nroPagina(a) - nroPagina(b));
+  }
+
+  // Con datos de la fila, la clave no depende del parámetro nocache de las
+  // imágenes: volver a dibujar la misma ficha no la baja de nuevo.
+  function firmaDeImagenes(imgs) {
+    return imgs.map((i) => i.src).join('|');
+  }
+
+  function claveDeFicha(imgs, datos) {
+    if (datos) return 'datos:' + JSON.stringify(datos) + '|paginas:' + imgs.length;
+    return 'imagenes:' + firmaDeImagenes(imgs);
+  }
+
+  function fichaEnPantalla() {
+    const imgs = imagenesDeLaFicha();
+    if (!imgs.length) return null;
+    const firma = firmaDeImagenes(imgs);
+    const { datos, origen } = datosDeLaFichaAbierta(firma);
+    return { clave: claveDeFicha(imgs, datos), imgs, datos, origen, firma };
+  }
+
+  function atarOSoltarClic(ficha) {
+    if (ficha.origen === 'clic') S.clicFila.firma = ficha.firma;
+    else S.clicFila = null;
+  }
+
+  function imagenesCargadas(imgs) {
+    return imgs.length > 0 && imgs.every((i) => i.isConnected && i.complete && i.naturalWidth > 0);
+  }
+
+  async function esperarCarga(imgs, msMax) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < msMax) {
+      if (imagenesCargadas(imgs)) return true;
+      await dormir(250);
+    }
+    return false;
   }
 
   // ------------------------------------------------------------ armado del PDF
 
-  async function bytesDeImagen(img) {
-    try {
-      const r = await fetch(img.src, { credentials: 'include' });
-      if (r.ok) return new Uint8Array(await r.arrayBuffer());
-    } catch (e) { /* se intenta por canvas */ }
+  // La imagen se copia tal como está en pantalla (R2, R5). Las imágenes son
+  // del mismo sitio, así que el lienzo no queda bloqueado.
+  async function bytesDeImagenEnPantalla(img) {
     const c = document.createElement('canvas');
     c.width = img.naturalWidth;
     c.height = img.naturalHeight;
     c.getContext('2d').drawImage(img, 0, 0);
     const blob = await new Promise((res) => c.toBlob(res, 'image/png'));
+    if (!blob) throw new Error('no se pudo copiar la imagen de la página ' + (nroPagina(img) || ''));
     return new Uint8Array(await blob.arrayBuffer());
   }
 
-  async function incrustar(doc, bytes) {
-    if (bytes[0] === 0xFF && bytes[1] === 0xD8) return doc.embedJpg(bytes);
-    if (bytes[0] === 0x89 && bytes[1] === 0x50) return doc.embedPng(bytes);
-    throw new Error('formato de imagen no reconocido');
+  function medidasEnHoja(im) {
+    const esc = Math.min((A4.ancho - A4.margen * 2) / im.width, (A4.alto - A4.margen * 2) / im.height);
+    const w = im.width * esc;
+    const h = im.height * esc;
+    return { x: (A4.ancho - w) / 2, y: (A4.alto - h) / 2, width: w, height: h };
+  }
+
+  async function agregarPagina(doc, img) {
+    const im = await doc.embedPng(await bytesDeImagenEnPantalla(img));
+    const pag = doc.addPage([A4.ancho, A4.alto]);
+    pag.drawImage(im, medidasEnHoja(im));
+  }
+
+  async function nuevoDocumento(titulo) {
+    const doc = await PDFLib.PDFDocument.create();
+    doc.setTitle(titulo);
+    doc.setProducer('RJU+ ' + APP.version);
+    doc.setCreator('RJU+ ' + APP.version);
+    return doc;
+  }
+
+  async function armarPdf(ficha, nombre) {
+    estado('Esperando que carguen las páginas...', 'trabajando');
+    if (!await esperarCarga(ficha.imgs, ESPERA_IMAGENES_MS)) {
+      throw new Error('las imágenes de la ficha no terminaron de cargar');
+    }
+    const doc = await nuevoDocumento(nombre.replace(/\.pdf$/, ''));
+    for (let i = 0; i < ficha.imgs.length; i++) {
+      estado('Armando página ' + (i + 1) + ' de ' + ficha.imgs.length + '...', 'trabajando');
+      await agregarPagina(doc, ficha.imgs[i]);
+    }
+    return new Blob([await doc.save()], { type: 'application/pdf' });
+  }
+
+  // --------------------------------------------------------------- guardado
+
+  function fueCancelada(e) {
+    let t;
+    try { t = JSON.stringify(e || {}); } catch (x) { t = String(e); }
+    return /cancel/i.test(t);
+  }
+
+  // Cuadro "Guardar como" de Tampermonkey (R9: nunca carpeta fija).
+  function descargarConDialogo(blob, nombre) {
+    const url = URL.createObjectURL(blob);
+    return new Promise((resolve) => {
+      let listo = false;
+      const fin = (r) => { if (!listo) { listo = true; resolve(r); } };
+      try {
+        GM_download({
+          url,
+          name: nombre,
+          saveAs: true,
+          onload: () => fin('guardado'),
+          onerror: (e) => fin(fueCancelada(e) ? 'cancelado' : 'fallo'),
+          ontimeout: () => fin('fallo')
+        });
+      } catch (e) { fin('fallo'); }
+    }).finally(() => setTimeout(() => URL.revokeObjectURL(url), 180000));
+  }
+
+  function hayDescargaDeTampermonkey() {
+    return typeof GM_download === 'function';
+  }
+
+  async function guardarPdf(blob, nombre) {
+    const r = hayDescargaDeTampermonkey() ? await descargarConDialogo(blob, nombre) : 'fallo';
+    if (r === 'fallo') dejarPendiente(blob, nombre);
+    return r === 'fallo' ? 'pendiente' : r;
+  }
+
+  function dejarPendiente(blob, nombre) {
+    S.pendiente = { blob, nombre };
+    if (UI.btnGuardar) UI.btnGuardar.style.display = 'block';
+  }
+
+  function quitarPendiente() {
+    S.pendiente = null;
+    if (UI.btnGuardar) UI.btnGuardar.style.display = 'none';
+  }
+
+  async function escribirConSelector(selector, p) {
+    const h = await selector.call(W, {
+      suggestedName: p.nombre,
+      types: [{ description: 'Documento PDF', accept: { 'application/pdf': ['.pdf'] } }]
+    });
+    const w = await h.createWritable();
+    await w.write(p.blob);
+    await w.close();
+  }
+
+  // Solo para navegadores sin selector de archivos: decide el navegador.
+  function guardarPorEnlace(p) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(p.blob);
+    a.download = p.nombre;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 180000);
+  }
+
+  // Se llama desde el botón "Guardar el PDF": el clic habilita el selector.
+  async function guardarPendiente() {
+    const p = S.pendiente;
+    if (!p) return;
+    const selector = W.showSaveFilePicker || window.showSaveFilePicker;
+    try {
+      if (typeof selector === 'function') await escribirConSelector(selector, p);
+      else guardarPorEnlace(p);
+      quitarPendiente();
+      estado('Guardado: ' + p.nombre, 'ok');
+    } catch (e) {
+      if (e && e.name === 'AbortError') estado('Guardado cancelado. El PDF sigue disponible.', 'aviso');
+      else estado('No se pudo guardar: ' + mensajeDeError(e), 'error');
+    }
+  }
+
+  // ------------------------------------------------------- bajada de la ficha
+
+  function anotarHistorial(ficha, nombre, resultado) {
+    S.historial.unshift({ hora: new Date(), nombre, paginas: ficha.imgs.length, resultado });
+    if (S.historial.length > 30) S.historial.length = 30;
+    pintarHistorial();
+  }
+
+  const TEXTO_RESULTADO = {
+    guardado: 'Guardada: ',
+    cancelado: 'Descarga cancelada: ',
+    pendiente: 'Tampermonkey no abrió "Guardar como". Usá "Guardar el PDF": '
+  };
+
+  function informarResultado(ficha, nombre, r) {
+    const extra = ficha.origen === 'ninguno' ? ' (sin datos de la fila: nombre genérico)' : '';
+    const tipo = r === 'guardado' ? 'ok' : 'aviso';
+    estado(TEXTO_RESULTADO[r] + nombre + extra, tipo);
+  }
+
+  function registrarResultado(ficha, nombre, r) {
+    if (r === 'guardado') { S.guardadas.add(ficha.clave); quitarPendiente(); }
+    if (r === 'cancelado') S.resueltas.add(ficha.clave);
+    if (r === 'pendiente') S.resueltas.add(ficha.clave);
+    anotarHistorial(ficha, nombre, r);
+    informarResultado(ficha, nombre, r);
+  }
+
+  function registrarFalla(ficha, e) {
+    S.intentos.set(ficha.clave, (S.intentos.get(ficha.clave) || 0) + 1);
+    estado('No se pudo armar el PDF: ' + mensajeDeError(e) + '.', 'error');
+  }
+
+  async function procesarFicha(ficha) {
+    const nombre = nombreArchivo(ficha.datos);
+    try {
+      const blob = await armarPdf(ficha, nombre);
+      estado('Elegí dónde guardar ' + nombre + '...', 'trabajando');
+      registrarResultado(ficha, nombre, await guardarPdf(blob, nombre));
+    } catch (e) {
+      registrarFalla(ficha, e);
+    }
   }
 
   async function bajarFicha(manual) {
-    if (trabajando) return;
-    const imgs = imagenesDeLaFicha();
-    if (!imgs.length) {
-      estado('No hay ninguna ficha abierta.', true);
+    if (S.trabajando) {
+      if (manual) estado('Ya hay una ficha en preparación.', 'aviso');
       return;
     }
-    trabajando = true;
+    const ficha = manual ? fichaEnPantalla() : S.fichaActual;
+    if (!ficha) { estado('No hay ninguna ficha abierta.', 'error'); return; }
+    S.trabajando = true;
     try {
-      estado('Esperando que carguen las paginas...');
-      const ok = await esperarCarga(imgs, 20000);
-      if (!ok) { estado('Las imagenes no terminaron de cargar. Reintentá.', true); return; }
-
-      const A4_ANCHO = 595.28;
-      const A4_ALTO = 841.89;
-      const MARGEN = 14;
-
-      const doc = await PDFLib.PDFDocument.create();
-      doc.setTitle(nombreArchivo().replace(/\.pdf$/, ''));
-      doc.setProducer('RJU+ ' + APP.version);
-      doc.setCreator('RJU+ ' + APP.version);
-
-      for (let i = 0; i < imgs.length; i++) {
-        estado('Armando pagina ' + (i + 1) + ' de ' + imgs.length + '...');
-        const bytes = await bytesDeImagen(imgs[i]);
-        const im = await incrustar(doc, bytes);
-        const pag = doc.addPage([A4_ANCHO, A4_ALTO]);
-        const esc = Math.min(
-          (A4_ANCHO - MARGEN * 2) / im.width,
-          (A4_ALTO - MARGEN * 2) / im.height
-        );
-        const w = im.width * esc;
-        const h = im.height * esc;
-        pag.drawImage(im, {
-          x: (A4_ANCHO - w) / 2,
-          y: (A4_ALTO - h) / 2,
-          width: w,
-          height: h
-        });
-      }
-
-      const pdf = await doc.save();
-      const blob = new Blob([pdf], { type: 'application/pdf' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = nombreArchivo();
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
-
-      claveFicha = imgs.map((i) => i.src).join('|');
-      const d = datosFila || {};
-      estado('Listo: ' + nombreArchivo() +
-        (d.apellido ? ' (' + d.apellido + ' ' + d.nombre + ', doc ' + d.documento + ')' : ''));
-    } catch (e) {
-      estado('Error al armar el PDF: ' + (e && e.message ? e.message : e), true);
+      await procesarFicha(ficha);
     } finally {
-      trabajando = false;
-      if (manual) { /* nada extra */ }
+      S.trabajando = false;
+      setTimeout(continuarAutomatico, 0);
     }
   }
 
-  // ------------------------------------------------------------------- interfaz
-
-  let elEstado = null;
-
-  function estado(txt, esError) {
-    if (!elEstado) return;
-    elEstado.textContent = txt;
-    elEstado.style.color = esError ? '#b3261e' : '#333';
+  function debeBajarSola(ficha) {
+    return !S.apagada && autoActiva() &&
+      !S.guardadas.has(ficha.clave) && !S.resueltas.has(ficha.clave) &&
+      (S.intentos.get(ficha.clave) || 0) < MAX_INTENTOS_AUTO;
   }
 
-  function css() {
-    const s = document.createElement('style');
-    s.textContent = [
-      '#rjuplus{position:fixed;right:16px;bottom:16px;z-index:999999;font-family:Segoe UI,Arial,sans-serif;font-size:13px}',
-      '#rjuplus .caja{background:#fff;border:2px solid ' + VERDE + ';border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.25);width:310px}',
-      '#rjuplus .barra{background:' + VERDE + ';color:#fff;padding:6px 10px;border-radius:4px 4px 0 0;display:flex;justify-content:space-between;align-items:center;cursor:move;user-select:none}',
-      '#rjuplus .ctrl{display:flex;gap:2px}',
-      '#rjuplus .ctrl span{width:20px;height:18px;line-height:18px;text-align:center;border-radius:3px;cursor:pointer;font-size:12px}',
-      '#rjuplus .ctrl span:hover{background:rgba(255,255,255,.25)}',
-      '#rjuplus .barra b{letter-spacing:.5px;font-size:14px}',
-      '#rjuplus .cuerpo{padding:10px}',
-      '#rjuplus button{background:' + VERDE + ';color:#fff;border:0;border-radius:5px;padding:7px 10px;cursor:pointer;font-size:13px;width:100%}',
-      '#rjuplus button:disabled{opacity:.6;cursor:default}',
-      '#rjuplus label{display:flex;gap:6px;align-items:center;margin:9px 0 6px;cursor:pointer}',
-      '#rjuplus .est{font-size:12px;line-height:1.35;min-height:32px;border-top:1px solid #e3e3e3;padding-top:7px;word-break:break-word}',
-      '#rjuplus .pie{font-size:10.5px;color:#777;margin-top:6px;border-top:1px solid #eee;padding-top:5px}',
-      '#rjuplus .pie a{color:' + VERDE + ';text-decoration:none}',
-      '#rjuplus .pastilla{background:' + VERDE + ';color:#fff;padding:7px 12px;border-radius:16px;cursor:move;box-shadow:0 3px 10px rgba(0,0,0,.3);font-weight:600;user-select:none}'
-    ].join('\n');
-    document.head.appendChild(s);
+  // Después de cada bajada: si la ficha en pantalla sigue sin guardarse (otra
+  // ficha que llegó mientras tanto, o un intento fallido), se baja (R4).
+  function continuarAutomatico() {
+    const ficha = S.fichaActual;
+    if (!ficha || S.trabajando || !debeBajarSola(ficha)) return;
+    const pausa = S.intentos.get(ficha.clave) ? PAUSA_REINTENTO_MS : 0;
+    setTimeout(() => {
+      if (S.fichaActual === ficha && debeBajarSola(ficha)) bajarFicha(false);
+    }, pausa);
   }
 
-  function construirPanel() {
-    if (document.getElementById('rjuplus')) return;
-    css();
+  // ------------------------------------------------------- revisión de página
 
-    const cont = document.createElement('div');
-    cont.id = 'rjuplus';
-
-    const caja = document.createElement('div');
-    caja.className = 'caja';
-
-    const barra = document.createElement('div');
-    barra.className = 'barra';
-    barra.innerHTML = '<b>RJU+</b><span class="ctrl">' +
-      '<span data-b="min" title="Minimizar">&#9472;</span>' +
-      '<span data-b="cerrar" title="Cerrar hasta recargar la pagina">&#10005;</span>' +
-      '</span>';
-
-    const cuerpo = document.createElement('div');
-    cuerpo.className = 'cuerpo';
-
-    const btn = document.createElement('button');
-    btn.textContent = 'Bajar ficha en PDF';
-    btn.addEventListener('click', () => bajarFicha(true));
-
-    const lab = document.createElement('label');
-    const chk = document.createElement('input');
-    chk.type = 'checkbox';
-    chk.checked = pref(CLAVE_AUTO, true);
-    chk.addEventListener('change', () => guardarPref(CLAVE_AUTO, chk.checked));
-    lab.appendChild(chk);
-    lab.appendChild(document.createTextNode('Bajar sola al abrir la ficha'));
-
-    elEstado = document.createElement('div');
-    elEstado.className = 'est';
-    elEstado.textContent = 'Esperando que abras una ficha.';
-
-    const pie = document.createElement('div');
-    pie.className = 'pie';
-    pie.innerHTML = APP.version + ' | ' + APP.autor + ' | ' +
-      '<a href="' + APP.licenciaUrl + '" target="_blank" rel="noopener">' + APP.licencia + '</a> | ' +
-      '<a href="' + APP.github + '" target="_blank" rel="noopener">repositorio</a>';
-
-    cuerpo.appendChild(btn);
-    cuerpo.appendChild(lab);
-    cuerpo.appendChild(elEstado);
-    cuerpo.appendChild(pie);
-    caja.appendChild(barra);
-    caja.appendChild(cuerpo);
-
-    const pastilla = document.createElement('div');
-    pastilla.className = 'pastilla';
-    pastilla.textContent = 'RJU+';
-    pastilla.style.display = 'none';
-
-    cont.appendChild(caja);
-    cont.appendChild(pastilla);
-    document.body.appendChild(cont);
-
-    function minimizar(v) {
-      caja.style.display = v ? 'none' : 'block';
-      pastilla.style.display = v ? 'block' : 'none';
-      guardarPref(CLAVE_MIN, v);
-    }
-
-    // Posicion libre, recordada entre visitas. Vale para el panel y para la
-    // pastilla: las dos son el mismo contenedor.
-    function aplicarPos(left, top) {
-      const a = cont.offsetWidth || 120;
-      const l = Math.max(4, Math.min(left, window.innerWidth - Math.min(a, 90) - 4));
-      const t = Math.max(4, Math.min(top, window.innerHeight - 28));
-      cont.style.left = l + 'px';
-      cont.style.top = t + 'px';
-      cont.style.right = 'auto';
-      cont.style.bottom = 'auto';
-    }
-
-    let recienArrastrado = false;
-
-    function habilitarArrastre(mango) {
-      let sx, sy, ox, oy, moviendo = false, arrastro = false;
-      mango.addEventListener('mousedown', (e) => {
-        if (e.target.closest('[data-b]')) return; // los botones de ventana no arrastran
-        e.preventDefault();
-        recienArrastrado = false;
-        const r = cont.getBoundingClientRect();
-        ox = r.left; oy = r.top; sx = e.clientX; sy = e.clientY;
-        moviendo = true; arrastro = false;
-        document.addEventListener('mousemove', alMover);
-        document.addEventListener('mouseup', alSoltar);
-      });
-      function alMover(e) {
-        if (!moviendo) return;
-        const dx = e.clientX - sx, dy = e.clientY - sy;
-        if (!arrastro && Math.abs(dx) + Math.abs(dy) < 4) return; // umbral: click o arrastre
-        arrastro = true;
-        cont.style.userSelect = 'none';
-        aplicarPos(ox + dx, oy + dy);
-      }
-      function alSoltar() {
-        moviendo = false;
-        cont.style.userSelect = '';
-        document.removeEventListener('mousemove', alMover);
-        document.removeEventListener('mouseup', alSoltar);
-        if (arrastro) {
-          recienArrastrado = true;
-          try {
-            localStorage.setItem(CLAVE_POS, JSON.stringify({
-              left: parseInt(cont.style.left, 10),
-              top: parseInt(cont.style.top, 10)
-            }));
-          } catch (e) { /* sin persistencia */ }
-        }
-      }
-    }
-
-    habilitarArrastre(barra);
-    habilitarArrastre(pastilla);
-
-    barra.querySelector('[data-b="min"]').addEventListener('click', () => minimizar(true));
-    barra.querySelector('[data-b="cerrar"]').addEventListener('click', () => { cont.style.display = 'none'; });
-    pastilla.addEventListener('click', () => {
-      if (recienArrastrado) { recienArrastrado = false; return; } // venia de moverla
-      minimizar(false);
-    });
-
-    try {
-      const guardada = JSON.parse(localStorage.getItem(CLAVE_POS));
-      if (guardada && typeof guardada.left === 'number') aplicarPos(guardada.left, guardada.top);
-    } catch (e) { /* sin posicion guardada */ }
-
-    window.addEventListener('resize', () => {
-      if (cont.style.left) aplicarPos(parseInt(cont.style.left, 10), parseInt(cont.style.top, 10));
-    });
-
-    if (pref(CLAVE_MIN, false)) minimizar(true);
-
-    window.__rjuplusAuto = () => chk.checked;
+  function avisarFichaDetectada(ficha) {
+    const quien = descripcionDatos(ficha.datos);
+    estado('Ficha detectada: ' + ficha.imgs.length + (ficha.imgs.length === 1 ? ' página' : ' páginas') +
+      (quien ? ', ' + quien : '') + '.', 'neutro');
   }
 
-  // ------------------------------------------------------------- ciclo de vida
+  function revisar() {
+    if (S.apagada) return;
+    engancharPagina();
+    const ficha = fichaEnPantalla();
+    if (!ficha) {
+      S.fichaActual = null;
+      if (!S.trabajando && !S.pendiente) estado('Esperando que abras una ficha.', 'neutro');
+      return;
+    }
+    if (S.fichaActual && S.fichaActual.clave === ficha.clave) return;
+    S.fichaActual = ficha;
+    atarOSoltarClic(ficha);
+    if (!S.trabajando) avisarFichaDetectada(ficha);
+    pintarMiniaturas(ficha);
+    continuarAutomatico();
+  }
 
+  // ------------------------------------------------- enganches con el sitio
+
+  function anotarClicEnGrilla(target, arg) {
+    const m = /^Select\$(\d+)$/.exec(String(arg || ''));
+    if (String(target) !== 'GridConsulta' || !m) return;
+    const g = grilla();
+    const tr = g ? filaPorIndice(g, parseInt(m[1], 10)) : null;
+    S.clicFila = tr ? { datos: datosDeFila(tr, columnasDeLaGrilla(g)), firma: null } : null;
+  }
+
+  // El enlace "Descargar" del sitio llama a __doPostBack('Descargar'): esa
+  // llamada no llega al servidor y se reemplaza por la bajada de RJU+ (R8).
+  function envolverPostBack(original) {
+    const envoltorio = function (target) {
+      if (String(target) === 'Descargar') { bajarFicha(true); return false; }
+      try { anotarClicEnGrilla(target, arguments[1]); } catch (e) { /* no interrumpir el sitio */ }
+      return original.apply(this, arguments);
+    };
+    envoltorio.__rjuplus = true;
+    return envoltorio;
+  }
+
+  function engancharPostBack() {
+    const actual = W.__doPostBack;
+    if (typeof actual !== 'function' || actual.__rjuplus) return;
+    W.__doPostBack = envolverPostBack(actual);
+  }
+
+  // El enlace del sitio es "javascript:Descargar()": se reemplaza la función.
   function reemplazarDescargar() {
-    // El boton del sitio hace __doPostBack("Descargar") dentro de un UpdatePanel:
-    // el servidor responde 500 y, cuando responde, puede entregar otra ficha.
-    if (window.Descargar && window.Descargar.__rjuplus) return;
+    if (W.Descargar && W.Descargar.__rjuplus) return;
     const nueva = function () { bajarFicha(true); return false; };
     nueva.__rjuplus = true;
-    window.Descargar = nueva;
-  }
-
-  async function revisar() {
-    engancharPostBack();
-    reemplazarDescargar();
-
-    const imgs = imagenesDeLaFicha();
-    if (!imgs.length) {
-      if (elEstado && !trabajando) estado('Esperando que abras una ficha.');
-      return;
-    }
-    const clave = imgs.map((i) => i.src).join('|');
-    if (clave === claveFicha) return;
-
-    const d = datosFila || {};
-    estado('Ficha detectada: ' + imgs.length + (imgs.length === 1 ? ' pagina' : ' paginas') +
-      (d.apellido ? ', ' + d.apellido + ' ' + d.nombre : '') + '.');
-
-    const auto = window.__rjuplusAuto ? window.__rjuplusAuto() : pref(CLAVE_AUTO, true);
-    if (auto) {
-      claveFicha = clave; // se marca antes para no disparar dos veces
-      await bajarFicha(false);
-    }
+    W.Descargar = nueva;
   }
 
   function engancharAjax() {
     try {
-      if (window.Sys && window.Sys.WebForms && window.Sys.WebForms.PageRequestManager) {
-        const prm = window.Sys.WebForms.PageRequestManager.getInstance();
-        if (prm && !prm.__rjuplus) {
-          prm.add_endRequest(() => setTimeout(revisar, 400));
-          prm.__rjuplus = true;
-        }
+      const prm = W.Sys && W.Sys.WebForms && W.Sys.WebForms.PageRequestManager &&
+        W.Sys.WebForms.PageRequestManager.getInstance();
+      if (prm && !prm.__rjuplus) {
+        prm.add_endRequest(() => setTimeout(revisar, 400));
+        prm.__rjuplus = true;
       }
     } catch (e) { /* el sitio puede no tener ScriptManager en todas las vistas */ }
   }
 
-  let pendiente = null;
-  function observar() {
-    const obs = new MutationObserver(() => {
-      clearTimeout(pendiente);
-      pendiente = setTimeout(revisar, 500);
-    });
-    obs.observe(document.body, { childList: true, subtree: true });
+  function engancharPagina() {
+    engancharPostBack();
+    reemplazarDescargar();
+    engancharAjax();
   }
+
+  // Los cambios del propio panel no cuentan: así no hay bucle (R1).
+  function esCambioDelPanel(m) {
+    const n = m.target.nodeType === 1 ? m.target : m.target.parentElement;
+    return !!(n && n.closest && n.closest('#' + ID_PANEL));
+  }
+
+  function alCambiarLaPagina(cambios) {
+    if (cambios.every(esCambioDelPanel)) return;
+    clearTimeout(S.temporizador);
+    S.temporizador = setTimeout(revisar, 500);
+  }
+
+  function observar() {
+    S.observador = new MutationObserver(alCambiarLaPagina);
+    S.observador.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // Cerrar apaga la bajada automática hasta recargar la página (R6). El
+  // enlace "Descargar" del sitio sigue pasando por RJU+, para no recibir la
+  // ficha equivocada; esa descarga siempre pregunta dónde guardar.
+  function apagar() {
+    S.apagada = true;
+    if (S.observador) S.observador.disconnect();
+    clearTimeout(S.temporizador);
+    UI.cont.style.display = 'none';
+  }
+
+  // ------------------------------------------------------------------ interfaz
+
+  function css() {
+    const v = COLOR.verde;
+    const s = document.createElement('style');
+    s.textContent = [
+      '#rjuplus{position:fixed;right:16px;bottom:16px;z-index:999999;font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#333}',
+      '#rjuplus .caja{background:#fff;border:2px solid ' + v + ';border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.25);width:310px}',
+      '#rjuplus.max .caja{width:min(640px,90vw)}',
+      '#rjuplus .barra{background:' + v + ';color:#fff;padding:6px 10px;border-radius:4px 4px 0 0;display:flex;justify-content:space-between;align-items:center;cursor:move;user-select:none}',
+      '#rjuplus .ctrl{display:flex;gap:2px}',
+      '#rjuplus .ctrl span{width:20px;height:18px;line-height:18px;text-align:center;border-radius:3px;cursor:pointer;font-size:12px}',
+      '#rjuplus .ctrl span:hover{background:rgba(255,255,255,.25)}',
+      '#rjuplus .barra b{letter-spacing:.5px;font-size:14px}',
+      '#rjuplus .cuerpo{padding:10px;max-height:80vh;overflow:auto}',
+      '#rjuplus button{background:' + v + ';color:#fff;border:0;border-radius:5px;padding:7px 10px;cursor:pointer;font-size:13px;width:100%;margin-bottom:6px}',
+      '#rjuplus button.secundario{background:' + COLOR.ambar + '}',
+      '#rjuplus label{display:flex;gap:6px;align-items:center;margin:4px 0 6px;cursor:pointer}',
+      '#rjuplus .est{font-size:12px;line-height:1.35;min-height:32px;border-top:1px solid #e3e3e3;padding-top:7px;word-break:break-word}',
+      '#rjuplus .ampliado{display:none;border-top:1px solid #e3e3e3;margin-top:8px;padding-top:6px}',
+      '#rjuplus.max .ampliado{display:block}',
+      '#rjuplus .ampliado h4{margin:4px 0;font-size:12px;color:' + v + '}',
+      '#rjuplus .minis{display:flex;flex-wrap:wrap;gap:6px}',
+      '#rjuplus .minis canvas{border:1px solid #ccc}',
+      '#rjuplus .hist{font-size:11.5px;margin:0;padding-left:16px}',
+      '#rjuplus .pie{font-size:10.5px;color:#777;margin-top:6px;border-top:1px solid #eee;padding-top:5px}',
+      '#rjuplus .pastilla{background:' + v + ';color:#fff;padding:7px 12px;border-radius:16px;cursor:move;box-shadow:0 3px 10px rgba(0,0,0,.3);font-weight:600;user-select:none}'
+    ].join('\n');
+    document.head.appendChild(s);
+  }
+
+  function botonVentana(accion, titulo, simbolo) {
+    return '<span data-b="' + accion + '" title="' + titulo + '">' + simbolo + '</span>';
+  }
+
+  function crearBarra() {
+    const barra = document.createElement('div');
+    barra.className = 'barra';
+    barra.innerHTML = '<b>RJU+</b><span class="ctrl">' +
+      botonVentana('min', 'Minimizar', '&#8211;') +
+      botonVentana('max', 'Maximizar o restaurar', '&#9633;') +
+      botonVentana('cerrar', 'Cerrar: RJU+ deja de bajar fichas solo hasta recargar la página', '&#10005;') +
+      '</span>';
+    return barra;
+  }
+
+  function crearBoton(texto, alHacerClic, clase) {
+    const b = document.createElement('button');
+    b.textContent = texto;
+    if (clase) b.className = clase;
+    b.addEventListener('click', alHacerClic);
+    return b;
+  }
+
+  function crearOpcionAuto() {
+    const lab = document.createElement('label');
+    UI.chkAuto = document.createElement('input');
+    UI.chkAuto.type = 'checkbox';
+    UI.chkAuto.checked = leerPref(CLAVE_AUTO, true);
+    UI.chkAuto.addEventListener('change', () => {
+      guardarPref(CLAVE_AUTO, UI.chkAuto.checked);
+      if (UI.chkAuto.checked) continuarAutomatico();
+    });
+    lab.appendChild(UI.chkAuto);
+    lab.appendChild(document.createTextNode('Bajar sola al abrir la ficha'));
+    return lab;
+  }
+
+  function crearAmpliado() {
+    const amp = document.createElement('div');
+    amp.className = 'ampliado';
+    amp.innerHTML = '<h4>Páginas de la ficha abierta (tal como se guardan)</h4><div class="minis"></div>' +
+      '<h4>Fichas de esta sesión</h4><ol class="hist"></ol>';
+    UI.minis = amp.querySelector('.minis');
+    UI.hist = amp.querySelector('.hist');
+    return amp;
+  }
+
+  function crearPie() {
+    const pie = document.createElement('div');
+    pie.className = 'pie';
+    pie.textContent = APP.version + ' | ' + APP.autor + ' | ' + APP.licencia;
+    return pie;
+  }
+
+  function crearCuerpo() {
+    const cuerpo = document.createElement('div');
+    cuerpo.className = 'cuerpo';
+    UI.btnGuardar = crearBoton('Guardar el PDF...', guardarPendiente, 'secundario');
+    UI.btnGuardar.style.display = 'none';
+    UI.est = document.createElement('div');
+    UI.est.className = 'est';
+    cuerpo.append(crearBoton('Bajar ficha en PDF', () => bajarFicha(true)), UI.btnGuardar,
+      crearOpcionAuto(), UI.est, crearAmpliado(), crearPie());
+    return cuerpo;
+  }
+
+  function crearPastilla() {
+    const p = document.createElement('div');
+    p.className = 'pastilla';
+    p.textContent = 'RJU+';
+    return p;
+  }
+
+  // ---------------------------------------------------- estado en pantalla
+
+  const COLOR_ESTADO = { ok: COLOR.verde, trabajando: COLOR.ambar, aviso: COLOR.ambar, error: COLOR.rojo, neutro: COLOR.verde };
+
+  // Solo escribe si el texto cambió (R1, R12).
+  function estado(txt, tipo) {
+    if (!UI.est) return;
+    const t = tipo || 'neutro';
+    if (UI.est.textContent === txt && UI.est.dataset.tipo === t) return;
+    UI.est.textContent = txt;
+    UI.est.dataset.tipo = t;
+    UI.est.style.color = t === 'error' ? COLOR.rojo : COLOR.texto;
+    UI.pastilla.style.background = COLOR_ESTADO[t] || COLOR.verde;
+    UI.pastilla.title = txt;
+  }
+
+  function miniatura(img) {
+    const c = document.createElement('canvas');
+    const esc = 140 / (img.naturalWidth || 140);
+    c.width = 140;
+    c.height = Math.round((img.naturalHeight || 198) * esc);
+    try { c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); } catch (e) { /* sin vista previa */ }
+    return c;
+  }
+
+  async function pintarMiniaturas(ficha) {
+    if (!UI.minis) return;
+    UI.minis.textContent = '';
+    if (!await esperarCarga(ficha.imgs, ESPERA_IMAGENES_MS) || S.fichaActual !== ficha) return;
+    ficha.imgs.forEach((img) => UI.minis.appendChild(miniatura(img)));
+  }
+
+  const TEXTO_HISTORIAL = { guardado: 'guardada', cancelado: 'cancelada', pendiente: 'sin guardar' };
+
+  function pintarHistorial() {
+    if (!UI.hist) return;
+    UI.hist.textContent = '';
+    S.historial.forEach((h) => {
+      const li = document.createElement('li');
+      li.textContent = horaCorta(h.hora) + ' | ' + h.nombre + ' | ' + h.paginas +
+        (h.paginas === 1 ? ' página' : ' páginas') + ' | ' + TEXTO_HISTORIAL[h.resultado];
+      UI.hist.appendChild(li);
+    });
+  }
+
+  // -------------------------------------------------- ventana: modos y lugar
+
+  function aplicarModo(modo) {
+    if (modo !== 'min') S.modoAnterior = modo;
+    S.modo = modo;
+    UI.caja.style.display = modo === 'min' ? 'none' : 'block';
+    UI.pastilla.style.display = modo === 'min' ? 'block' : 'none';
+    UI.cont.classList.toggle('max', modo === 'max');
+    if (UI.cont.style.left) aplicarPos(parseInt(UI.cont.style.left, 10), parseInt(UI.cont.style.top, 10));
+  }
+
+  function alternarMaximizar() {
+    aplicarModo(S.modo === 'max' ? 'normal' : 'max');
+  }
+
+  function aplicarPos(left, top) {
+    const ancho = UI.cont.offsetWidth || 120;
+    const alto = UI.cont.offsetHeight || 28;
+    const l = Math.max(4, Math.min(left, window.innerWidth - Math.min(ancho, 90) - 4));
+    const t = Math.max(4, Math.min(top, window.innerHeight - Math.min(alto, 28) - 4));
+    UI.cont.style.left = l + 'px';
+    UI.cont.style.top = t + 'px';
+    UI.cont.style.right = 'auto';
+    UI.cont.style.bottom = 'auto';
+  }
+
+  const ARRASTRE = { activo: false, movio: false, recien: false, sx: 0, sy: 0, ox: 0, oy: 0 };
+
+  function alMoverArrastre(e) {
+    if (!ARRASTRE.activo) return;
+    const dx = e.clientX - ARRASTRE.sx;
+    const dy = e.clientY - ARRASTRE.sy;
+    if (!ARRASTRE.movio && Math.abs(dx) + Math.abs(dy) < 4) return; // umbral: clic o arrastre
+    ARRASTRE.movio = true;
+    aplicarPos(ARRASTRE.ox + dx, ARRASTRE.oy + dy);
+  }
+
+  function alSoltarArrastre() {
+    ARRASTRE.activo = false;
+    ARRASTRE.recien = ARRASTRE.movio;
+    UI.cont.style.userSelect = '';
+    document.removeEventListener('mousemove', alMoverArrastre);
+    document.removeEventListener('mouseup', alSoltarArrastre);
+  }
+
+  function alEmpezarArrastre(e) {
+    if (e.target.closest('[data-b]')) return; // los botones de ventana no arrastran
+    e.preventDefault();
+    const r = UI.cont.getBoundingClientRect();
+    Object.assign(ARRASTRE, { activo: true, movio: false, recien: false, sx: e.clientX, sy: e.clientY, ox: r.left, oy: r.top });
+    UI.cont.style.userSelect = 'none';
+    document.addEventListener('mousemove', alMoverArrastre);
+    document.addEventListener('mouseup', alSoltarArrastre);
+  }
+
+  function alHacerClicEnPastilla() {
+    if (ARRASTRE.recien) { ARRASTRE.recien = false; return; } // venía de moverla
+    aplicarModo(S.modoAnterior);
+  }
+
+  function conectarVentana(barra) {
+    barra.addEventListener('mousedown', alEmpezarArrastre);
+    UI.pastilla.addEventListener('mousedown', alEmpezarArrastre);
+    barra.querySelector('[data-b="min"]').addEventListener('click', () => aplicarModo('min'));
+    barra.querySelector('[data-b="max"]').addEventListener('click', alternarMaximizar);
+    barra.querySelector('[data-b="cerrar"]').addEventListener('click', apagar);
+    UI.pastilla.addEventListener('click', alHacerClicEnPastilla);
+    window.addEventListener('resize', () => {
+      if (UI.cont.style.left) aplicarPos(parseInt(UI.cont.style.left, 10), parseInt(UI.cont.style.top, 10));
+    });
+  }
+
+  // Criterio común de Lex+: al cargar, minimizada y anclada abajo a la derecha.
+  function construirPanel() {
+    if (document.getElementById(ID_PANEL)) return;
+    css();
+    UI.cont = document.createElement('div');
+    UI.cont.id = ID_PANEL;
+    UI.caja = document.createElement('div');
+    UI.caja.className = 'caja';
+    const barra = crearBarra();
+    UI.caja.append(barra, crearCuerpo());
+    UI.pastilla = crearPastilla();
+    UI.cont.append(UI.caja, UI.pastilla);
+    document.body.appendChild(UI.cont);
+    conectarVentana(barra);
+    aplicarModo('min');
+    estado('Esperando que abras una ficha.', 'neutro');
+  }
+
+  // ------------------------------------------------------------- arranque
 
   function iniciar() {
     construirPanel();
-    engancharPostBack();
-    engancharAjax();
-    reemplazarDescargar();
+    engancharPagina();
     observar();
     revisar();
-    // El ScriptManager puede registrarse despues del document-idle.
+    // El ScriptManager puede registrarse después de document-idle.
     setTimeout(engancharAjax, 1500);
     setTimeout(engancharAjax, 4000);
   }
