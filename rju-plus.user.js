@@ -1,15 +1,14 @@
 // ==UserScript==
 // @name         RJU+ - Bajar ficha del Registro de Juicios Universales
 // @namespace    ignacio.kinbaum
-// @version      0.3.0
-// @description  Baja en PDF la ficha del Registro de Juicios Universales de la SCBA, armada con las mismas imágenes que se ven en pantalla. No usa la descarga del sitio, que falla con error de servidor y a veces entrega la ficha de otro registro. Puede bajar la ficha sola apenas se abre; cada descarga pregunta dónde guardarse. Panel movible, con minimizar, maximizar y cerrar.
+// @version      0.3.1
+// @description  Baja en PDF la ficha del Registro de Juicios Universales de la SCBA, armada con las mismas imágenes que se ven en pantalla. No usa la descarga del sitio, que falla con error de servidor y a veces entrega la ficha de otro registro. Puede preparar la ficha sola apenas se abre; cada descarga pregunta dónde guardarse, nunca en una carpeta fija. Panel movible, con minimizar, maximizar y cerrar.
 // @author       Ignacio Kinbaum
 // @license      Todos los derechos reservados
 // @copyright    2026, Ignacio Kinbaum (estudiojuridicokinbaum@gmail.com)
 // @supportURL   mailto:estudiojuridicokinbaum@gmail.com
 // @match        https://rju.scba.gov.ar/*
 // @run-at       document-idle
-// @grant        GM_download
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        unsafeWindow
@@ -31,19 +30,26 @@
  *   2. El PDF se arma copiando esas imágenes tal como están en pantalla
  *      (lienzo). No se vuelven a pedir al servidor: el servidor es el que, a
  *      veces, entrega la ficha de otro registro.
- *   3. Los datos del nombre del archivo se toman de la fila que el propio RJU
- *      marca como elegida en la grilla después del postback (fondo celeste).
- *      Si no hay fila marcada, se usan los datos de la fila en la que se hizo
- *      clic; si tampoco los hay, el archivo se nombra en forma genérica.
- *   4. Cada descarga abre el cuadro "Guardar como" (GM_download con saveAs).
- *      Si Tampermonkey no puede abrirlo, el panel ofrece "Guardar el PDF",
- *      que abre el selector de archivos de Chrome. Nunca hay carpeta fija.
- *   5. Una ficha se da por guardada solo después de una descarga exitosa.
- *      Las bajadas automáticas que fallan se reintentan hasta tres veces.
+ *   3. Cada juego de imágenes distinto es una ficha distinta. Los datos del
+ *      nombre del archivo (año, apellido, nombre, documento) se toman de la
+ *      fila de la grilla en la que se hizo clic, y solo valen para la primera
+ *      ficha distinta de la que había en pantalla al momento del clic. El clic
+ *      se olvida si el pedido al sitio termina sin ficha nueva o si la página
+ *      hace cualquier otro envío. Si la fila que el RJU marca como elegida
+ *      (fondo celeste) no coincide con la del clic, o si no hay clic, el
+ *      archivo se nombra en forma genérica.
+ *   4. Cada guardado abre el selector de archivos de Chrome, que siempre
+ *      pregunta dónde guardar (decisión del autor del 04/11/2026). El selector
+ *      necesita un clic: con la bajada automática, RJU+ arma el PDF solo y el
+ *      panel se abre con el botón "Elegir dónde guardar". Nunca se guarda en
+ *      una carpeta fija ni en la carpeta Descargas.
+ *   5. Una ficha se da por guardada solo después de escribirse el archivo.
+ *      Las preparaciones automáticas que fallan se reintentan hasta tres veces.
  *   6. El observador de la página ignora los cambios del propio panel.
  *
- * Origen de las correcciones de la 0.3.0: reporte de revisión de código del
- * 28/10/2026 (hallazgos R1 a R14) y criterios comunes de Lex+.
+ * Origen de las correcciones: reporte de revisión de código del 28/10/2026
+ * (hallazgos R1 a R14, versión 0.3.0) y revisión independiente de la 0.3.0
+ * del 03/11/2026 (versión 0.3.1).
  */
 /* global PDFLib */
 (function () {
@@ -55,7 +61,7 @@
 
   const APP = {
     nombre: 'RJU+ - Bajar ficha del Registro de Juicios Universales',
-    version: 'beta 0.3.0',
+    version: 'beta 0.3.1',
     autor: 'Ignacio Kinbaum',
     licencia: 'Todos los derechos reservados'
   };
@@ -94,14 +100,13 @@
   // ------------------------------------------------------------------- estado
 
   const S = {
-    clicFila: null,          // { datos, firma }: fila tomada en el momento del clic
-    fichaActual: null,       // { clave, imgs, datos }
+    clic: null,              // { datos, indice, firmaAntes }: clic en la grilla aún sin ficha
+    fichaActual: null,       // { clave, firma, imgs, datos, origen }
     guardadas: new Set(),    // claves de fichas ya guardadas
-    resueltas: new Set(),    // claves cuya descarga se canceló a pedido
-    intentos: new Map(),     // clave -> intentos automáticos fallidos
+    intentos: new Map(),     // clave -> preparaciones automáticas fallidas
     trabajando: false,
     apagada: false,
-    pendiente: null,         // { blob, nombre } a la espera de "Guardar el PDF"
+    pendiente: null,         // { blob, nombre, ficha }: PDF armado, a la espera de "Elegir dónde guardar"
     historial: [],           // fichas procesadas en esta sesión
     observador: null,
     temporizador: null,
@@ -144,6 +149,8 @@
     try { localStorage.setItem(clave, valor ? '1' : '0'); } catch (e) { /* sin persistencia */ }
   }
 
+  // La bajada automática viene activada por decisión del autor ("que la
+  // ficha se baje directamente al abrirla").
   function autoActiva() {
     return UI.chkAuto ? UI.chkAuto.checked : leerPref(CLAVE_AUTO, true);
   }
@@ -179,8 +186,27 @@
     return dosCifras(d.getHours()) + ':' + dosCifras(d.getMinutes());
   }
 
+  // Error propio, con el texto ya en castellano.
+  function errorPropio(texto) {
+    const e = new Error(texto);
+    e.rjuplus = true;
+    return e;
+  }
+
+  const ERRORES_DEL_NAVEGADOR = [
+    [/tainted|SecurityError/i, 'el navegador no permitió copiar la imagen de la ficha'],
+    [/PDFLib/, 'no se cargó la biblioteca que arma el PDF; recargá la página'],
+    [/NotAllowedError|user activation|gesture/i, 'Chrome no permitió abrir el cuadro para elegir dónde guardar; volvé a hacer clic'],
+    [/QuotaExceeded|NoModificationAllowed|InvalidState/i, 'no se pudo escribir el archivo en la carpeta elegida'],
+    [/memory|allocation/i, 'no alcanzó la memoria para armar el PDF']
+  ];
+
+  // Los mensajes del navegador vienen en inglés: se muestran en castellano.
   function mensajeDeError(e) {
-    return e && e.message ? e.message : String(e);
+    if (e && e.rjuplus) return e.message;
+    const crudo = (e && (e.name + ' ' + e.message)) || String(e);
+    const regla = ERRORES_DEL_NAVEGADOR.find(([re]) => re.test(crudo));
+    return regla ? regla[1] : 'ocurrió un error inesperado del navegador';
   }
 
   function nombreArchivo(datos) {
@@ -241,7 +267,7 @@
     return porEnlace || null;
   }
 
-  // Fila que el RJU marca como elegida después del postback.
+  // Fila que el RJU marca como elegida después del envío.
   function filaMarcada(g) {
     const filas = filasDeDatos(g);
     const celeste = filas.find((tr) => tr.style.backgroundColor === COLOR_FILA_ELEGIDA);
@@ -251,18 +277,24 @@
     return distintas.length === 1 ? distintas[0] : null;
   }
 
-  // El clic sirve solo para la ficha que llega después de él: queda atado a
-  // esas imágenes y una ficha distinta nunca hereda sus datos (R3).
-  function clicVigente(firma) {
-    return !!S.clicFila && (!S.clicFila.firma || S.clicFila.firma === firma);
+  function mismosDatos(a, b) {
+    return JSON.stringify(a) === JSON.stringify(b);
   }
 
-  function datosDeLaFichaAbierta(firma) {
+  // La fila marcada sirve de control: si existe y no es la del clic, los
+  // datos no se usan (X4).
+  function marcaContradiceAlClic(datosClic) {
     const g = grilla();
     const tr = g ? filaMarcada(g) : null;
-    if (tr) return { datos: datosDeFila(tr, columnasDeLaGrilla(g)), origen: 'grilla' };
-    if (clicVigente(firma)) return { datos: S.clicFila.datos, origen: 'clic' };
-    return { datos: null, origen: 'ninguno' };
+    return !!tr && !mismosDatos(datosDeFila(tr, columnasDeLaGrilla(g)), datosClic);
+  }
+
+  // El clic vale solo para una ficha distinta de la que había al hacerlo (X1, X2).
+  function datosDeLaFichaAbierta(firma) {
+    const c = S.clic;
+    if (!c || c.firmaAntes === firma) return { datos: null, origen: 'ninguno' };
+    if (marcaContradiceAlClic(c.datos)) return { datos: null, origen: 'conflicto' };
+    return { datos: c.datos, origen: 'clic' };
   }
 
   // ------------------------------------------------------- ficha en pantalla
@@ -288,28 +320,21 @@
       .sort((a, b) => nroPagina(a) - nroPagina(b));
   }
 
-  // Con datos de la fila, la clave no depende del parámetro nocache de las
-  // imágenes: volver a dibujar la misma ficha no la baja de nuevo.
   function firmaDeImagenes(imgs) {
     return imgs.map((i) => i.src).join('|');
   }
 
-  function claveDeFicha(imgs, datos) {
-    if (datos) return 'datos:' + JSON.stringify(datos) + '|paginas:' + imgs.length;
-    return 'imagenes:' + firmaDeImagenes(imgs);
+  function firmaEnPantalla() {
+    return firmaDeImagenes(imagenesDeLaFicha());
   }
 
+  // Cada juego de imágenes es una ficha: la clave no depende de los datos.
   function fichaEnPantalla() {
     const imgs = imagenesDeLaFicha();
     if (!imgs.length) return null;
     const firma = firmaDeImagenes(imgs);
     const { datos, origen } = datosDeLaFichaAbierta(firma);
-    return { clave: claveDeFicha(imgs, datos), imgs, datos, origen, firma };
-  }
-
-  function atarOSoltarClic(ficha) {
-    if (ficha.origen === 'clic') S.clicFila.firma = ficha.firma;
-    else S.clicFila = null;
+    return { clave: 'imagenes:' + firma, firma, imgs, datos, origen };
   }
 
   function imagenesCargadas(imgs) {
@@ -335,7 +360,7 @@
     c.height = img.naturalHeight;
     c.getContext('2d').drawImage(img, 0, 0);
     const blob = await new Promise((res) => c.toBlob(res, 'image/png'));
-    if (!blob) throw new Error('no se pudo copiar la imagen de la página ' + (nroPagina(img) || ''));
+    if (!blob) throw errorPropio('no se pudo copiar la imagen de la página ' + (nroPagina(img) || ''));
     return new Uint8Array(await blob.arrayBuffer());
   }
 
@@ -363,7 +388,7 @@
   async function armarPdf(ficha, nombre) {
     estado('Esperando que carguen las páginas...', 'trabajando');
     if (!await esperarCarga(ficha.imgs, ESPERA_IMAGENES_MS)) {
-      throw new Error('las imágenes de la ficha no terminaron de cargar');
+      throw errorPropio('las imágenes de la ficha no terminaron de cargar');
     }
     const doc = await nuevoDocumento(nombre.replace(/\.pdf$/, ''));
     for (let i = 0; i < ficha.imgs.length; i++) {
@@ -375,44 +400,39 @@
 
   // --------------------------------------------------------------- guardado
 
-  function fueCancelada(e) {
-    let t;
-    try { t = JSON.stringify(e || {}); } catch (x) { t = String(e); }
-    return /cancel/i.test(t);
+  function selectorDeArchivos() {
+    const s = W.showSaveFilePicker || window.showSaveFilePicker;
+    return typeof s === 'function' ? s : null;
   }
 
-  // Cuadro "Guardar como" de Tampermonkey (R9: nunca carpeta fija).
-  function descargarConDialogo(blob, nombre) {
-    const url = URL.createObjectURL(blob);
-    return new Promise((resolve) => {
-      let listo = false;
-      const fin = (r) => { if (!listo) { listo = true; resolve(r); } };
-      try {
-        GM_download({
-          url,
-          name: nombre,
-          saveAs: true,
-          onload: () => fin('guardado'),
-          onerror: (e) => fin(fueCancelada(e) ? 'cancelado' : 'fallo'),
-          ontimeout: () => fin('fallo')
-        });
-      } catch (e) { fin('fallo'); }
-    }).finally(() => setTimeout(() => URL.revokeObjectURL(url), 180000));
+  // Abre el cuadro "Guardar como" de Chrome. Tiene que llamarse en el mismo
+  // clic, antes de cualquier espera. Devuelve null si se canceló.
+  async function pedirDestino(nombre) {
+    const selector = selectorDeArchivos();
+    if (!selector) throw errorPropio('este navegador no permite elegir dónde guardar; usá Chrome actualizado');
+    try {
+      return await selector.call(W, {
+        suggestedName: nombre,
+        startIn: 'documents',
+        types: [{ description: 'Documento PDF', accept: { 'application/pdf': ['.pdf'] } }]
+      });
+    } catch (e) {
+      if (e && e.name === 'AbortError') return null;
+      throw e;
+    }
   }
 
-  function hayDescargaDeTampermonkey() {
-    return typeof GM_download === 'function';
+  async function escribir(destino, blob) {
+    const w = await destino.createWritable();
+    await w.write(blob);
+    await w.close();
   }
 
-  async function guardarPdf(blob, nombre) {
-    const r = hayDescargaDeTampermonkey() ? await descargarConDialogo(blob, nombre) : 'fallo';
-    if (r === 'fallo') dejarPendiente(blob, nombre);
-    return r === 'fallo' ? 'pendiente' : r;
-  }
-
-  function dejarPendiente(blob, nombre) {
-    S.pendiente = { blob, nombre };
-    if (UI.btnGuardar) UI.btnGuardar.style.display = 'block';
+  function mostrarPendiente(blob, nombre, ficha) {
+    S.pendiente = { blob, nombre, ficha };
+    UI.btnGuardar.textContent = 'Elegir dónde guardar ' + nombre;
+    UI.btnGuardar.style.display = 'block';
+    if (S.modo === 'min') aplicarModo(S.modoAnterior);
   }
 
   function quitarPendiente() {
@@ -420,44 +440,7 @@
     if (UI.btnGuardar) UI.btnGuardar.style.display = 'none';
   }
 
-  async function escribirConSelector(selector, p) {
-    const h = await selector.call(W, {
-      suggestedName: p.nombre,
-      types: [{ description: 'Documento PDF', accept: { 'application/pdf': ['.pdf'] } }]
-    });
-    const w = await h.createWritable();
-    await w.write(p.blob);
-    await w.close();
-  }
-
-  // Solo para navegadores sin selector de archivos: decide el navegador.
-  function guardarPorEnlace(p) {
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(p.blob);
-    a.download = p.nombre;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 180000);
-  }
-
-  // Se llama desde el botón "Guardar el PDF": el clic habilita el selector.
-  async function guardarPendiente() {
-    const p = S.pendiente;
-    if (!p) return;
-    const selector = W.showSaveFilePicker || window.showSaveFilePicker;
-    try {
-      if (typeof selector === 'function') await escribirConSelector(selector, p);
-      else guardarPorEnlace(p);
-      quitarPendiente();
-      estado('Guardado: ' + p.nombre, 'ok');
-    } catch (e) {
-      if (e && e.name === 'AbortError') estado('Guardado cancelado. El PDF sigue disponible.', 'aviso');
-      else estado('No se pudo guardar: ' + mensajeDeError(e), 'error');
-    }
-  }
-
-  // ------------------------------------------------------- bajada de la ficha
+  // ------------------------------------------------------- historial y avisos
 
   function anotarHistorial(ficha, nombre, resultado) {
     S.historial.unshift({ hora: new Date(), nombre, paginas: ficha.imgs.length, resultado });
@@ -465,73 +448,112 @@
     pintarHistorial();
   }
 
-  const TEXTO_RESULTADO = {
-    guardado: 'Guardada: ',
-    cancelado: 'Descarga cancelada: ',
-    pendiente: 'Tampermonkey no abrió "Guardar como". Usá "Guardar el PDF": '
-  };
-
-  function informarResultado(ficha, nombre, r) {
-    const extra = ficha.origen === 'ninguno' ? ' (sin datos de la fila: nombre genérico)' : '';
-    const tipo = r === 'guardado' ? 'ok' : 'aviso';
-    estado(TEXTO_RESULTADO[r] + nombre + extra, tipo);
+  function aclaracionDeDatos(ficha) {
+    if (ficha.origen === 'conflicto') return ' (la fila marcada no coincide con la del clic: nombre genérico)';
+    if (ficha.origen === 'ninguno') return ' (sin datos de la fila: nombre genérico)';
+    return '';
   }
 
-  function registrarResultado(ficha, nombre, r) {
-    if (r === 'guardado') { S.guardadas.add(ficha.clave); quitarPendiente(); }
-    if (r === 'cancelado') S.resueltas.add(ficha.clave);
-    if (r === 'pendiente') S.resueltas.add(ficha.clave);
-    anotarHistorial(ficha, nombre, r);
-    informarResultado(ficha, nombre, r);
+  function registrarGuardado(ficha, nombre) {
+    S.guardadas.add(ficha.clave);
+    quitarPendiente();
+    anotarHistorial(ficha, nombre, 'guardado');
+    estado('Guardada: ' + nombre + aclaracionDeDatos(ficha), 'ok');
   }
 
-  function registrarFalla(ficha, e) {
-    S.intentos.set(ficha.clave, (S.intentos.get(ficha.clave) || 0) + 1);
-    estado('No se pudo armar el PDF: ' + mensajeDeError(e) + '.', 'error');
+  function registrarFalla(ficha, e, automatica) {
+    if (automatica) S.intentos.set(ficha.clave, (S.intentos.get(ficha.clave) || 0) + 1);
+    estado((automatica ? 'No se pudo armar el PDF: ' : 'No se pudo bajar la ficha: ') + mensajeDeError(e) + '.', 'error');
   }
 
-  async function procesarFicha(ficha) {
+  // --------------------------------------------- preparación automática
+
+  // Arma el PDF de la ficha nueva y deja listo "Elegir dónde guardar".
+  async function prepararFicha(ficha) {
     const nombre = nombreArchivo(ficha.datos);
-    try {
-      const blob = await armarPdf(ficha, nombre);
-      estado('Elegí dónde guardar ' + nombre + '...', 'trabajando');
-      registrarResultado(ficha, nombre, await guardarPdf(blob, nombre));
-    } catch (e) {
-      registrarFalla(ficha, e);
-    }
-  }
-
-  async function bajarFicha(manual) {
-    if (S.trabajando) {
-      if (manual) estado('Ya hay una ficha en preparación.', 'aviso');
-      return;
-    }
-    const ficha = manual ? fichaEnPantalla() : S.fichaActual;
-    if (!ficha) { estado('No hay ninguna ficha abierta.', 'error'); return; }
     S.trabajando = true;
     try {
-      await procesarFicha(ficha);
+      const blob = await armarPdf(ficha, nombre);
+      if (S.fichaActual !== ficha) return; // llegó otra ficha mientras tanto
+      if (S.pendiente) anotarHistorial(S.pendiente.ficha, S.pendiente.nombre, 'pendiente');
+      mostrarPendiente(blob, nombre, ficha);
+      estado('PDF listo: elegí dónde guardar ' + nombre + aclaracionDeDatos(ficha) + '.', 'aviso');
+    } catch (e) {
+      registrarFalla(ficha, e, true);
     } finally {
       S.trabajando = false;
       setTimeout(continuarAutomatico, 0);
     }
   }
 
-  function debeBajarSola(ficha) {
-    return !S.apagada && autoActiva() &&
-      !S.guardadas.has(ficha.clave) && !S.resueltas.has(ficha.clave) &&
+  function yaPreparada(ficha) {
+    return !!S.pendiente && S.pendiente.ficha.clave === ficha.clave;
+  }
+
+  function debePrepararSola(ficha) {
+    return !S.apagada && autoActiva() && !S.guardadas.has(ficha.clave) && !yaPreparada(ficha) &&
       (S.intentos.get(ficha.clave) || 0) < MAX_INTENTOS_AUTO;
   }
 
-  // Después de cada bajada: si la ficha en pantalla sigue sin guardarse (otra
-  // ficha que llegó mientras tanto, o un intento fallido), se baja (R4).
+  // Después de cada preparación: si la ficha en pantalla sigue sin prepararse
+  // (otra ficha que llegó mientras tanto, o un intento fallido), se prepara (R4).
   function continuarAutomatico() {
     const ficha = S.fichaActual;
-    if (!ficha || S.trabajando || !debeBajarSola(ficha)) return;
+    if (!ficha || S.trabajando || !debePrepararSola(ficha)) return;
     const pausa = S.intentos.get(ficha.clave) ? PAUSA_REINTENTO_MS : 0;
     setTimeout(() => {
-      if (S.fichaActual === ficha && debeBajarSola(ficha)) bajarFicha(false);
+      if (S.fichaActual === ficha && !S.trabajando && debePrepararSola(ficha)) prepararFicha(ficha);
     }, pausa);
+  }
+
+  // ------------------------------------------------- guardado con un clic
+
+  // Botón "Elegir dónde guardar": guarda el PDF ya armado.
+  async function guardarPendiente() {
+    const p = S.pendiente;
+    if (!p) return;
+    try {
+      const destino = await pedirDestino(p.nombre);
+      if (!destino) { estado('Guardado cancelado. El PDF sigue listo para guardar.', 'aviso'); return; }
+      await escribir(destino, p.blob);
+      registrarGuardado(p.ficha, p.nombre);
+    } catch (e) {
+      estado('No se pudo guardar: ' + mensajeDeError(e) + '.', 'error');
+    }
+  }
+
+  async function bajarConDestino(ficha) {
+    const nombre = nombreArchivo(ficha.datos);
+    const destino = await pedirDestino(nombre); // primero, mientras dura el clic
+    if (!destino) { estado('Guardado cancelado.', 'aviso'); return; }
+    S.trabajando = true;
+    try {
+      await escribir(destino, await armarPdf(ficha, nombre));
+      registrarGuardado(ficha, nombre);
+    } finally {
+      S.trabajando = false;
+    }
+  }
+
+  // "Bajar ficha en PDF" y el enlace "Descargar" del sitio: siempre con clic.
+  // La ficha se toma siempre de la pantalla; si es la misma ya aceptada, se
+  // conservan sus datos (con el panel cerrado, la aceptada puede ser vieja).
+  function fichaParaBajar() {
+    const enPantalla = fichaEnPantalla();
+    if (!enPantalla) return null;
+    return S.fichaActual && S.fichaActual.clave === enPantalla.clave ? S.fichaActual : enPantalla;
+  }
+
+  async function bajarFicha() {
+    const ficha = fichaParaBajar();
+    if (ficha && yaPreparada(ficha)) { await guardarPendiente(); return; }
+    if (S.trabajando) { estado('Ya hay una ficha en preparación.', 'aviso'); return; }
+    if (!ficha) { estado('No hay ninguna ficha abierta.', 'error'); return; }
+    try {
+      await bajarConDestino(ficha);
+    } catch (e) {
+      registrarFalla(ficha, e, false);
+    }
   }
 
   // ------------------------------------------------------- revisión de página
@@ -539,42 +561,52 @@
   function avisarFichaDetectada(ficha) {
     const quien = descripcionDatos(ficha.datos);
     estado('Ficha detectada: ' + ficha.imgs.length + (ficha.imgs.length === 1 ? ' página' : ' páginas') +
-      (quien ? ', ' + quien : '') + '.', 'neutro');
+      (quien ? ', ' + quien : '') + aclaracionDeDatos(ficha) + '.', 'neutro');
   }
 
-  function revisar() {
-    if (S.apagada) return;
-    engancharPagina();
-    const ficha = fichaEnPantalla();
-    if (!ficha) {
-      S.fichaActual = null;
-      if (!S.trabajando && !S.pendiente) estado('Esperando que abras una ficha.', 'neutro');
-      return;
-    }
-    if (S.fichaActual && S.fichaActual.clave === ficha.clave) return;
+  // El aviso solo se escribe cuando la ficha cambia: un error queda a la
+  // vista aunque la página cambie (R12).
+  function sinFicha() {
+    if (!S.fichaActual) return;
+    S.fichaActual = null;
+    if (!S.trabajando && !S.pendiente) estado('Esperando que abras una ficha.', 'neutro');
+  }
+
+  function aceptarFicha(ficha) {
     S.fichaActual = ficha;
-    atarOSoltarClic(ficha);
+    S.clic = null; // el clic se usa una sola vez
     if (!S.trabajando) avisarFichaDetectada(ficha);
     pintarMiniaturas(ficha);
     continuarAutomatico();
+  }
+
+  // Con el panel cerrado se sigue registrando la ficha abierta (para el
+  // enlace "Descargar" del sitio), pero no se prepara nada solo.
+  function revisar() {
+    engancharPagina();
+    const ficha = fichaEnPantalla();
+    if (!ficha) { sinFicha(); return; }
+    if (S.fichaActual && S.fichaActual.clave === ficha.clave) return;
+    aceptarFicha(ficha);
   }
 
   // ------------------------------------------------- enganches con el sitio
 
   function anotarClicEnGrilla(target, arg) {
     const m = /^Select\$(\d+)$/.exec(String(arg || ''));
-    if (String(target) !== 'GridConsulta' || !m) return;
+    if (String(target) !== 'GridConsulta' || !m) { S.clic = null; return; }
     const g = grilla();
     const tr = g ? filaPorIndice(g, parseInt(m[1], 10)) : null;
-    S.clicFila = tr ? { datos: datosDeFila(tr, columnasDeLaGrilla(g)), firma: null } : null;
+    S.clic = tr ? { datos: datosDeFila(tr, columnasDeLaGrilla(g)), indice: m[1], firmaAntes: firmaEnPantalla() } : null;
   }
 
   // El enlace "Descargar" del sitio llama a __doPostBack('Descargar'): esa
   // llamada no llega al servidor y se reemplaza por la bajada de RJU+ (R8).
+  // Cualquier otro envío anota u olvida el clic en la grilla.
   function envolverPostBack(original) {
     const envoltorio = function (target) {
-      if (String(target) === 'Descargar') { bajarFicha(true); return false; }
-      try { anotarClicEnGrilla(target, arguments[1]); } catch (e) { /* no interrumpir el sitio */ }
+      if (String(target) === 'Descargar') { bajarFicha(); return false; }
+      try { anotarClicEnGrilla(target, arguments[1]); } catch (e) { S.clic = null; }
       return original.apply(this, arguments);
     };
     envoltorio.__rjuplus = true;
@@ -590,9 +622,18 @@
   // El enlace del sitio es "javascript:Descargar()": se reemplaza la función.
   function reemplazarDescargar() {
     if (W.Descargar && W.Descargar.__rjuplus) return;
-    const nueva = function () { bajarFicha(true); return false; };
+    const nueva = function () { bajarFicha(); return false; };
     nueva.__rjuplus = true;
     W.Descargar = nueva;
+  }
+
+  // Al terminar un pedido al sitio: se revisa la página y, si no llegó una
+  // ficha nueva, el clic se olvida (X1: el pedido falló).
+  function alTerminarPedido() {
+    setTimeout(() => {
+      revisar();
+      S.clic = null;
+    }, 400);
   }
 
   function engancharAjax() {
@@ -600,7 +641,7 @@
       const prm = W.Sys && W.Sys.WebForms && W.Sys.WebForms.PageRequestManager &&
         W.Sys.WebForms.PageRequestManager.getInstance();
       if (prm && !prm.__rjuplus) {
-        prm.add_endRequest(() => setTimeout(revisar, 400));
+        prm.add_endRequest(alTerminarPedido);
         prm.__rjuplus = true;
       }
     } catch (e) { /* el sitio puede no tener ScriptManager en todas las vistas */ }
@@ -629,13 +670,14 @@
     S.observador.observe(document.body, { childList: true, subtree: true });
   }
 
-  // Cerrar apaga la bajada automática hasta recargar la página (R6). El
+  // Cerrar apaga la preparación automática hasta recargar la página (R6). El
   // enlace "Descargar" del sitio sigue pasando por RJU+, para no recibir la
   // ficha equivocada; esa descarga siempre pregunta dónde guardar.
   function apagar() {
     S.apagada = true;
     if (S.observador) S.observador.disconnect();
     clearTimeout(S.temporizador);
+    quitarPendiente();
     UI.cont.style.display = 'none';
   }
 
@@ -654,8 +696,8 @@
       '#rjuplus .ctrl span:hover{background:rgba(255,255,255,.25)}',
       '#rjuplus .barra b{letter-spacing:.5px;font-size:14px}',
       '#rjuplus .cuerpo{padding:10px;max-height:80vh;overflow:auto}',
-      '#rjuplus button{background:' + v + ';color:#fff;border:0;border-radius:5px;padding:7px 10px;cursor:pointer;font-size:13px;width:100%;margin-bottom:6px}',
-      '#rjuplus button.secundario{background:' + COLOR.ambar + '}',
+      '#rjuplus button{background:' + v + ';color:#fff;border:0;border-radius:5px;padding:7px 10px;cursor:pointer;font-size:13px;width:100%;margin-bottom:6px;word-break:break-word}',
+      '#rjuplus button.secundario{background:' + COLOR.ambar + ';font-weight:600}',
       '#rjuplus label{display:flex;gap:6px;align-items:center;margin:4px 0 6px;cursor:pointer}',
       '#rjuplus .est{font-size:12px;line-height:1.35;min-height:32px;border-top:1px solid #e3e3e3;padding-top:7px;word-break:break-word}',
       '#rjuplus .ampliado{display:none;border-top:1px solid #e3e3e3;margin-top:8px;padding-top:6px}',
@@ -680,7 +722,7 @@
     barra.innerHTML = '<b>RJU+</b><span class="ctrl">' +
       botonVentana('min', 'Minimizar', '&#8211;') +
       botonVentana('max', 'Maximizar o restaurar', '&#9633;') +
-      botonVentana('cerrar', 'Cerrar: RJU+ deja de bajar fichas solo hasta recargar la página', '&#10005;') +
+      botonVentana('cerrar', 'Cerrar: RJU+ deja de preparar fichas solo hasta recargar la página', '&#10005;') +
       '</span>';
     return barra;
   }
@@ -703,7 +745,7 @@
       if (UI.chkAuto.checked) continuarAutomatico();
     });
     lab.appendChild(UI.chkAuto);
-    lab.appendChild(document.createTextNode('Bajar sola al abrir la ficha'));
+    lab.appendChild(document.createTextNode('Preparar sola al abrir la ficha'));
     return lab;
   }
 
@@ -727,11 +769,11 @@
   function crearCuerpo() {
     const cuerpo = document.createElement('div');
     cuerpo.className = 'cuerpo';
-    UI.btnGuardar = crearBoton('Guardar el PDF...', guardarPendiente, 'secundario');
+    UI.btnGuardar = crearBoton('Elegir dónde guardar', guardarPendiente, 'secundario');
     UI.btnGuardar.style.display = 'none';
     UI.est = document.createElement('div');
     UI.est.className = 'est';
-    cuerpo.append(crearBoton('Bajar ficha en PDF', () => bajarFicha(true)), UI.btnGuardar,
+    cuerpo.append(UI.btnGuardar, crearBoton('Bajar ficha en PDF', bajarFicha),
       crearOpcionAuto(), UI.est, crearAmpliado(), crearPie());
     return cuerpo;
   }
@@ -747,7 +789,7 @@
 
   const COLOR_ESTADO = { ok: COLOR.verde, trabajando: COLOR.ambar, aviso: COLOR.ambar, error: COLOR.rojo, neutro: COLOR.verde };
 
-  // Solo escribe si el texto cambió (R1, R12).
+  // Solo escribe si el texto o el tipo cambiaron (R1, R12).
   function estado(txt, tipo) {
     if (!UI.est) return;
     const t = tipo || 'neutro';
@@ -775,7 +817,7 @@
     ficha.imgs.forEach((img) => UI.minis.appendChild(miniatura(img)));
   }
 
-  const TEXTO_HISTORIAL = { guardado: 'guardada', cancelado: 'cancelada', pendiente: 'sin guardar' };
+  const TEXTO_HISTORIAL = { guardado: 'guardada', pendiente: 'sin guardar' };
 
   function pintarHistorial() {
     if (!UI.hist) return;
@@ -860,7 +902,8 @@
     });
   }
 
-  // Criterio común de Lex+: al cargar, minimizada y anclada abajo a la derecha.
+  // Criterio común de Lex+: al cargar, minimizada y anclada abajo a la
+  // derecha (confirmado por el autor el 04/11/2026).
   function construirPanel() {
     if (document.getElementById(ID_PANEL)) return;
     css();
