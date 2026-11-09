@@ -1,12 +1,12 @@
 # RJU+: bitácora
 
-Archivo único de bitácora de RJU+. Reúne las 2 bitácoras por versión que había en el repositorio, de la más reciente a la más antigua. Unificado el 09/11/2026.
+Archivo único de bitácora de RJU+. Reúne las 2 bitácoras por versión que había en la carpeta del proyecto, de la más reciente a la más antigua. Unificado el 09/11/2026.
 
 Reglas de este archivo:
 
 - Cada versión nueva agrega un apartado arriba de todo, con el título "Versión X.Y.Z (DD/MM/AAAA)", y registra solo lo nuevo de esa versión, sin copiar lo de las anteriores.
 - Las referencias de otros documentos a un archivo de bitácora por versión remiten al apartado de este archivo que indica ese mismo nombre como archivo original.
-- Los archivos originales se conservan sin cambios en la carpeta `bitacoras-por-version`.
+- Los archivos originales se conservan sin cambios en la subcarpeta `bitacoras-por-version`.
 - Al unificar se omitieron los párrafos que repetían, idénticos, el texto de una versión anterior (0 caracteres de 14.048); el texto completo de cada versión sigue en su archivo original.
 
 ## Versión 0.3.1 (04/11/2026)
